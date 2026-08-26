@@ -380,12 +380,20 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             # per-batch CPU->GPU transfer automatically.
             ar_inputs = [((args, kwargs),) for args, kwargs in cur_inputs]
 
+            # Consume pre-seeded FP16 reference outputs if the pipeline provided
+            # them (see SequentialPipeline fp_ref fix). When set, auto_round's
+            # collect_reference forward pass is skipped, saving ~10-20 GB VRAM.
+            _fp_ref = getattr(self, "_fp_ref_outputs", None)
+            if hasattr(self, "_fp_ref_outputs"):
+                del self._fp_ref_outputs
+
             q_input, _ = ar.quantize_block(
                 block=decoding_layer,
                 inputs=ar_inputs,
                 q_input=self._q_input,
                 device=str(device),
                 auto_offload=auto_offload,
+                reference_output=_fp_ref,
             )
             self._q_input = q_input
 

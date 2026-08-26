@@ -157,6 +157,38 @@ class SequentialPipeline(CalibrationPipeline):
                                 activations.update(batch_idx, outputs)
                                 activations.delete(batch_idx, subgraph.consumed_names)
 
+                    # Pre-seed AutoRound's FP16 reference outputs from the cache so
+                    # auto_round's collect_reference forward pass can be skipped.
+                    # collect_reference runs a full FP16 forward pass on the next
+                    # subgraph, which OOMs on 140 GB GPUs with a 122B model loaded.
+                    # The next subgraph's input activations are already cached here
+                    # as the FP16 reference, so we pass them directly.
+                    if (
+                        not dataset_args.propagate_error
+                        and subgraph_index < num_subgraphs - 1
+                    ):
+                        _next_names = subgraphs[subgraph_index + 1].input_names
+                        # Prefer name-based selection: "hidden_states"/"inputs_embeds"
+                        # are unambiguous. Fall back to ndim==3 for non-standard
+                        # architectures — position_ids (ndim=2) and 4D masks are
+                        # excluded either way.
+                        _HIDDEN_STATE_KEYS = {"hidden_states", "inputs_embeds"}
+                        _fp_ref = []
+                        for _b in range(num_batches):
+                            _batch = activations.batch_intermediates[_b]
+                            for _name in _next_names:
+                                if _name in _batch:
+                                    _v = _batch[_name].value
+                                    if isinstance(_v, torch.Tensor) and (
+                                        _name in _HIDDEN_STATE_KEYS or _v.ndim == 3
+                                    ):
+                                        _fp_ref.append(_v)
+                                        break
+                        if len(_fp_ref) == num_batches:
+                            for _m in modifiers:
+                                if type(_m).__name__ == "AutoRoundModifier":
+                                    _m._fp_ref_outputs = _fp_ref
+
                     LifecycleCallbacks.sequential_epoch_end(subgraph.submodules(model))
 
                     if dataset_args.propagate_error:
