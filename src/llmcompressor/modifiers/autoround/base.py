@@ -1,3 +1,4 @@
+import gc
 import os
 from contextlib import contextmanager
 from typing import Any
@@ -36,6 +37,28 @@ from llmcompressor.utils.dev import get_main_device
 from llmcompressor.utils.pytorch import infer_sequential_targets
 
 __all__ = ["AutoRoundModifier", "fix_batch_if_needed"]
+
+
+def _log_mem(tag: str) -> None:
+    """Log RSS + VRAM for memory diagnostics during AutoRound quantize_block."""
+    try:
+        import psutil
+
+        rss_gb = psutil.Process().memory_info().rss / 1024**3
+    except Exception:
+        rss_gb = float("nan")
+    if torch.cuda.is_available():
+        alloc_gb = torch.cuda.memory_allocated() / 1024**3
+        resv_gb = torch.cuda.memory_reserved() / 1024**3
+    else:
+        alloc_gb = resv_gb = float("nan")
+    logger.info(
+        "[MemLog] {}: RSS={:.1f}GB  VRAM_alloc={:.1f}GB  VRAM_resv={:.1f}GB",
+        tag,
+        rss_gb,
+        alloc_gb,
+        resv_gb,
+    )
 
 
 class _LLModelWrapper(torch.nn.Module):
@@ -338,6 +361,14 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             layer_name = decoding_layer._tmp_name
             if layer_name in self._capture_hooks:
                 self.remove_hooks({self._capture_hooks.pop(layer_name)})
+            # After removing this hook, remaining count tells us if this is the last block.
+            is_last_block = len(self._capture_hooks) == 0
+            logger.info(
+                "[AutoRound] {} | is_last_block={} | hooks_remaining={}",
+                layer_name,
+                is_last_block,
+                len(self._capture_hooks),
+            )
             cur_inputs = self._all_module_input.pop(layer_name, None)
             if not cur_inputs:
                 raise RuntimeError(
@@ -387,6 +418,21 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             if hasattr(self, "_fp_ref_outputs"):
                 del self._fp_ref_outputs
 
+            # On the last block, _q_input (previous block's quantized outputs, ~90 GB
+            # CPU RAM for N=8192) will not be used again — release it before the
+            # write-back/barrier phase inside quantize_block to reduce peak RSS.
+            if is_last_block and self._q_input is not None:
+                q_items = len(self._q_input) if hasattr(self._q_input, "__len__") else 1
+                logger.info(
+                    "[AutoRound] Last block: releasing _q_input ({} items) before quantize_block",
+                    q_items,
+                )
+                self._q_input = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            _log_mem(f"pre-quantize_block [{layer_name}]")
             q_input, _ = ar.quantize_block(
                 block=decoding_layer,
                 inputs=ar_inputs,
@@ -396,6 +442,21 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 reference_output=_fp_ref,
             )
             self._q_input = q_input
+
+            # Eagerly release the AutoRound object and its internal state (fp_outputs,
+            # best_params, optimizer buffers) right after quantize_block returns.
+            # This frees memory before auto_round's internal barrier/write-back is
+            # considered complete by the calling code, reducing peak RSS at the
+            # critical last-block boundary.
+            logger.info(
+                "[AutoRound] quantize_block done for {} | releasing ar/ar_inputs/_fp_ref",
+                layer_name,
+            )
+            del ar, ar_inputs, _fp_ref
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _log_mem(f"post-quantize_block [{layer_name}]")
 
             decoding_layer = self._unwrapper_quantized_layer(decoding_layer)
 
@@ -414,6 +475,7 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                 device_module.empty_cache()
         elif torch.accelerator.is_available():
             torch.accelerator.empty_cache()
+        _log_mem("post_autoround_cleanup")
 
     def on_calibration_end(self, state: State, event: Event, **kwargs):
         """
