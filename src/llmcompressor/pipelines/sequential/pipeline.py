@@ -186,8 +186,8 @@ class SequentialPipeline(CalibrationPipeline):
                                         break
                         if len(_fp_ref) == num_batches:
                             for _m in modifiers:
-                                if type(_m).__name__ == "AutoRoundModifier":
-                                    _m._fp_ref_outputs = _fp_ref
+                                if hasattr(_m, "set_fp_ref_outputs"):
+                                    _m.set_fp_ref_outputs(_fp_ref)
 
                     LifecycleCallbacks.sequential_epoch_end(subgraph.submodules(model))
 

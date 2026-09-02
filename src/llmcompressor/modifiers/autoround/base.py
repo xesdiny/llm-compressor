@@ -202,7 +202,17 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
     # private variables
     _all_module_input: dict[str, list[tuple]] = PrivateAttr(default_factory=dict)
     _q_input: torch.Tensor | None = PrivateAttr(default=None)
+    _fp_ref_outputs: list | None = PrivateAttr(default=None)
     _capture_hooks: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def set_fp_ref_outputs(self, outputs: list) -> None:
+        """Supply pre-computed FP16 reference outputs from IntermediatesCache.
+
+        When set, the next quantize_block call passes them as reference_output
+        to auto-round, skipping the redundant collect_reference forward pass.
+        Called by SequentialPipeline before sequential_epoch_end fires.
+        """
+        self._fp_ref_outputs = outputs
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
@@ -412,11 +422,10 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             ar_inputs = [((args, kwargs),) for args, kwargs in cur_inputs]
 
             # Consume pre-seeded FP16 reference outputs if the pipeline provided
-            # them (see SequentialPipeline fp_ref fix). When set, auto_round's
-            # collect_reference forward pass is skipped, saving ~10-20 GB VRAM.
-            _fp_ref = getattr(self, "_fp_ref_outputs", None)
-            if hasattr(self, "_fp_ref_outputs"):
-                del self._fp_ref_outputs
+            # them via set_fp_ref_outputs(). When set, auto_round's
+            # collect_reference forward pass is skipped, saving ~39 GB CPU RAM/rank.
+            _fp_ref = self._fp_ref_outputs
+            self._fp_ref_outputs = None
 
             # On the last block, _q_input (previous block's quantized outputs, ~90 GB
             # CPU RAM for N=8192) will not be used again — release it before the
