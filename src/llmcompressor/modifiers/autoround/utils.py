@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -65,12 +66,14 @@ def init_gpu_group_dist(gpus_per_group: int | None = None) -> tuple[int, int, in
         backend = "gloo"
 
     torch.accelerator.set_device_index(main_gpu)
+    _timeout_sec = int(os.environ.get("TORCH_NCCL_PG_TIMEOUT_SEC", "7200"))
     dist.init_process_group(
         backend=backend,
         init_method="env://",
         rank=rank,
         world_size=world_size,
         device_id=torch.device(f"{accel_type}:{main_gpu}"),
+        timeout=timedelta(seconds=_timeout_sec),
     )
     dist.barrier()
     return rank, world_size, main_gpu
